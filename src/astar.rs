@@ -173,6 +173,10 @@ fn find_route_inner<N: SearchNode>(
         .get_node(to_id)
         .ok_or(AStarError::InvalidReference(to_id))?;
 
+    if to_id != to_node.osm_id {
+        return Err(AStarError::InvalidReference(to_id));
+    }
+
     // Push the `from` node to the queue
     {
         let initial = N::initial(from_id);
@@ -261,6 +265,13 @@ fn find_route_inner<N: SearchNode>(
 ///
 /// Returns an empty vector if there is no route between the two nodes.
 ///
+/// `from_id` must identify a specific [Node] in the [Graph], and
+/// `to_id` must identify a specific **canonical** (`id == osm_id`) [Node];
+/// otherwise [AStarError::InvalidReference] is returned.
+///
+/// The returned route may end at a different, non-canonical node, as long as its
+/// [osm_id](Node::osm_id) is equal to `to_id`.
+///
 /// For graphs with turn restrictions, use [find_route_without_turn_around](super::find_route_without_turn_around),
 /// as this implementation will generate instructions with immediate turnarounds
 /// (A-B-A) to circumvent any restrictions.
@@ -283,6 +294,13 @@ pub fn find_route(
 /// to find the shortest route between two points in the provided graph.
 ///
 /// Returns an empty list if there is no route between the two points.
+///
+/// `from_id` must identify a specific [Node] in the [Graph], and
+/// `to_id` must identify a specific **canonical** (`id == osm_id`) [Node];
+/// otherwise [AStarError::InvalidReference] is returned.
+///
+/// The returned route may end at a different, non-canonical node, as long as its
+/// [osm_id](Node::osm_id) is equal to `to_id`.
 ///
 /// For graphs without turn restrictions, use [find_route](super::find_route) as it runs faster.
 /// This function has an extra dimension - it needs to not only consider the current node,
@@ -583,6 +601,16 @@ mod tests {
         assert_eq!(
             find_route_without_turn_around(&g, 1, 3, 100),
             Ok(vec![1_i64, 20, 4, 5, 3])
+        );
+    }
+
+    #[test]
+    fn to_node_in_turn_restriction() {
+        let g = turn_restriction_fixture();
+        assert_eq!(find_route(&g, 1, 2, 100), Ok(vec![1_i64, 20]));
+        assert_eq!(
+            find_route_without_turn_around(&g, 1, 2, 100),
+            Ok(vec![1_i64, 20]),
         );
     }
 }

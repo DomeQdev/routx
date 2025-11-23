@@ -642,6 +642,10 @@ typedef struct RoutxRouteResult {
  *
  * Returns an @ref RoutxRouteResultTypeOk "ok result" with an empty vector if no route exists.
  *
+ * `from_id` must identify a @ref RoutxNode "node" in the @ref RoutxGraph "Graph", and
+ * `to_id` must identify a specific **canonical** (`id == osm_id`) @ref RoutxNode "node";
+ * otherwise @ref RoutxRouteResultTypeInvalidReference "invalid reference" is returned.
+ *
  * For graphs with turn restrictions, use routx_find_route_without_turn_around(), as this
  * implementation will generate unrealistic instructions with immediate turnarounds (A-B-A) to
  * circumvent any restrictions.
@@ -661,6 +665,10 @@ RoutxRouteResult routx_find_route(RoutxGraph const* graph, int64_t from, int64_t
  * The returned result must be destroyed by calling routx_route_result_delete().
  *
  * Returns an @ref RoutxRouteResultTypeOk "ok result" with an empty vector if no route exists.
+ *
+ * `from_id` must identify a @ref RoutxNode "node" in the @ref RoutxGraph "Graph", and
+ * `to_id` must identify a specific **canonical** (`id == osm_id`) @ref RoutxNode "node";
+ * otherwise @ref RoutxRouteResultTypeInvalidReference "invalid reference" is returned.
  *
  * For graphs without turn restrictions, use routx_find_route(), as it runs faster.
  * This function has an extra dimension - it needs to not only consider the current node,

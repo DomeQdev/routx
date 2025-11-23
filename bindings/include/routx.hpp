@@ -591,6 +591,10 @@ class Graph {
      *
      * Returns an empty @ref Route no route exists.
      *
+     * `from_id` must identify a @ref Node in the @ref Graph, and `to_id` must identify
+     * a specific **canonical** (`id == osm_id`) @ref Node; otherwise @ref InvalidReference is
+     * thrown.
+     *
      * For graphs with turn restrictions, use find_route_without_turn_around(), as this
      * implementation will generate unrealistic instructions with immediate turnarounds (A-B-A) to
      * circumvent any restrictions.
@@ -600,8 +604,6 @@ class Graph {
      * route exists requires expanding all nodes accessible from the start, which is usually very
      * time consuming, especially on large datasets. Recommended (and default) value is
      * @ref DEFAULT_STEP_LIMIT.
-     *
-     * If `from` or `to` don't exist, throws @ref InvalidReference.
      */
     Route find_route(int64_t from, int64_t to, size_t step_limit = DEFAULT_STEP_LIMIT) const {
         auto result = routx_find_route(m_impl, from, to, step_limit);
@@ -626,7 +628,11 @@ class Graph {
      *
      * Returns an empty @ref Route no route exists.
      *
-     * For graphs without turn restrictions, use routx_find_route(), as it runs faster.
+     * `from_id` must identify a @ref Node in the @ref Graph, and `to_id` must identify
+     * a specific **canonical** (`id == osm_id`) @ref Node; otherwise @ref InvalidReference is
+     * thrown.
+     *
+     * For graphs without turn restrictions, use find_route(), as it runs faster.
      * This function has an extra dimension - it needs to not only consider the current node,
      * but also what was the previous node to prevent immediate turnaround (A-B-A) instructions.
      *
@@ -635,8 +641,6 @@ class Graph {
      * route exists requires expanding all nodes accessible from the start, which is usually very
      * time consuming, especially on large datasets. Recommended (and default) value is
      * @ref DEFAULT_STEP_LIMIT.
-     *
-     * If `from` or `to` don't exist, throws @ref InvalidReference.
      */
     Route find_route_without_turn_around(int64_t from, int64_t to,
                                          size_t step_limit = DEFAULT_STEP_LIMIT) const {
