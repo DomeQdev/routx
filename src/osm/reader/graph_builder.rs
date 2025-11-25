@@ -475,31 +475,54 @@ impl GraphChange {
         assert!(nodes.len() >= 3);
 
         let mut cloned_nodes = vec![nodes[0]];
+        let mut following_another_restriction = false;
+
         for i in 1..nodes.len() {
-            let previous_node_id = cloned_nodes[i - 1];
+            let previous_id = cloned_nodes[i - 1];
             let osm_id = nodes[i];
-            let candidate_node_id = self.get_to_node_id_by_edge(g, previous_node_id, osm_id)?;
+            let candidate_id = self.get_to_node_id_by_edge(g, previous_id, osm_id)?;
 
-            let is_cloned = osm_id != candidate_node_id;
-            let is_last = Some(osm_id) == nodes.last().cloned();
+            let is_second = i == 1;
+            let is_last = i == nodes.len() - 1;
 
-            // We need to make a clone of `osm_id` if we don't have a cloned node already and it's not the last node
-            let node_id = if !is_cloned && !is_last {
-                let node_id = self.clone_node(candidate_node_id);
+            // We can reuse the node if:
+            // - it's last
+            // - it's second (in this case we're said to be "following another restriction")
+            // - we're following another restriction.
+            //
+            // The last node doesn't participate in the restriction, and gets as back to the
+            // standard, non-restricted graph.
+            //
+            // The 2nd and 3rd clause represent the "if a B' node and A-B' edge already exist".
+            // We can't start reusing nodes in the middle of the restriction, as that breaks
+            // semi-overlapping restrictions (see test_add_relation_two_semi_overlapping_prohibitory).
+            //
+            // Also, to cover a case where the followed restriction is shorter than the currently
+            // processed one, we're said to no longer be "following another restriction" once
+            // we break out back to the canonical nodes.
+            if is_second && candidate_id != osm_id {
+                following_another_restriction = true;
+            }
+            if following_another_restriction && candidate_id == osm_id {
+                following_another_restriction = false;
+            }
 
-                // Relink previous_node_id -> osm_id to previous_node_id -> node_id
-                let cost = self.get_edge_cost(g, previous_node_id, osm_id);
-                self.edges_to_remove.insert((previous_node_id, osm_id));
-                self.edges_to_add
-                    .entry(previous_node_id)
-                    .or_insert_with(HashMap::new)
-                    .insert(node_id, cost);
-                node_id
+            // NOTE: following_another_restriction implies that the `candidate_id` is cloned
+            debug_assert!(candidate_id != osm_id || !following_another_restriction);
+
+            let new_id = if is_last || following_another_restriction {
+                candidate_id
             } else {
-                candidate_node_id
+                let cloned_id = self.clone_node(candidate_id);
+
+                // Relink previous_id -> candidate_id to previous_id -> cloned_id
+                let cost = self.get_edge_cost(g, previous_id, candidate_id);
+                self.remove_edge(previous_id, candidate_id);
+                self.add_edge(previous_id, cloned_id, cost);
+                cloned_id
             };
 
-            cloned_nodes.push(node_id);
+            cloned_nodes.push(new_id);
         }
 
         Some(cloned_nodes)
@@ -561,6 +584,13 @@ impl GraphChange {
     /// Ensure the edge from `from` to `to` does not exist
     fn remove_edge(&mut self, from: i64, to: i64) {
         self.edges_to_remove.insert((from, to));
+    }
+
+    fn add_edge(&mut self, from: i64, to: i64, cost: f32) {
+        self.edges_to_add
+            .entry(from)
+            .or_insert_with(HashMap::new)
+            .insert(to, cost);
     }
 
     fn apply(&self, b: &mut GraphBuilder<'_>) {
@@ -1093,6 +1123,157 @@ mod tests {
             assert_edge!(g, 101, 3);
             assert_no_edge!(g, 101, 4);
             assert_no_edge!(g, 101, 5);
+        }
+
+        #[test]
+        fn test_add_relation_two_semi_overlapping_prohibitory() {
+            //     9  8
+            //     ↓  ↑
+            // 10←-3←-2←-7
+            //     ↓  ↑
+            // 11-→4-→1-→6
+            //     ↓  ↑
+            //    12  5
+            //
+            // no_u_turn "ns": 1 2 3 4 (phantom nodes: 1 101 102 4)
+            // no_u_turn "ew": 4 1 2 3 (phantom nodes: 4 103 104 3)
+
+            let mut g = Graph::default();
+
+            {
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                b.phantom_node_id_counter = 100;
+
+                b.add_node(n!(1, 0.2, 0.1));
+                b.add_node(n!(2, 0.2, 0.2));
+                b.add_node(n!(3, 0.1, 0.2));
+                b.add_node(n!(4, 0.1, 0.1));
+                b.add_node(n!(5, 0.2, 0.0));
+                b.add_node(n!(6, 0.3, 0.1));
+                b.add_node(n!(7, 0.4, 0.2));
+                b.add_node(n!(8, 0.2, 0.3));
+                b.add_node(n!(9, 0.1, 0.3));
+                b.add_node(n!(10, 0.0, 0.2));
+                b.add_node(n!(11, 0.0, 0.1));
+                b.add_node(n!(12, 0.1, 0.0));
+
+                b.add_way(w!(
+                    20,
+                    vec![5, 1],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    21,
+                    vec![1, 2],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    22,
+                    vec![2, 8],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+
+                b.add_way(w!(
+                    23,
+                    vec![9, 3],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    24,
+                    vec![3, 4],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    25,
+                    vec![4, 12],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+
+                b.add_way(w!(
+                    26,
+                    vec![7, 2],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    27,
+                    vec![2, 3],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    28,
+                    vec![3, 10],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+
+                b.add_way(w!(
+                    29,
+                    vec![11, 4],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    30,
+                    vec![4, 1],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+                b.add_way(w!(
+                    31,
+                    vec![1, 6],
+                    tags!("highway": "primary", "oneway": "yes")
+                ));
+
+                b.add_relation(r!(
+                    20,
+                    vec![
+                        m!(FeatureType::Way, 21, "from"),
+                        m!(FeatureType::Way, 27, "via"),
+                        m!(FeatureType::Way, 24, "to"),
+                    ],
+                    tags!("type": "restriction", "restriction": "no_u_turn")
+                ));
+                b.add_relation(r!(
+                    21,
+                    vec![
+                        m!(FeatureType::Way, 30, "from"),
+                        m!(FeatureType::Way, 21, "via"),
+                        m!(FeatureType::Way, 27, "to"),
+                    ],
+                    tags!("type": "restriction", "restriction": "no_u_turn")
+                ));
+
+                assert_eq!(b.phantom_node_id_counter, 104);
+            }
+
+            // Check that we're right with node clones
+            assert_eq!(g.get_node(101).map(|n| n.osm_id), Some(2));
+            assert_eq!(g.get_node(102).map(|n| n.osm_id), Some(3));
+            assert_eq!(g.get_node(103).map(|n| n.osm_id), Some(1));
+            assert_eq!(g.get_node(104).map(|n| n.osm_id), Some(2));
+
+            // Check "ns" no_u_turn
+            assert_edge!(g, 1, 6);
+            assert_no_edge!(g, 1, 2);
+            assert_edge!(g, 1, 101);
+
+            assert_edge!(g, 101, 8);
+            assert_no_edge!(g, 101, 3);
+            assert_edge!(g, 101, 102);
+
+            assert_edge!(g, 102, 10);
+            assert_no_edge!(g, 102, 4);
+
+            // Check "ew" no_u_turn
+            assert_edge!(g, 4, 12);
+            assert_no_edge!(g, 4, 1);
+            assert_edge!(g, 4, 103);
+
+            assert_edge!(g, 103, 6);
+            assert_edge!(g, 103, 104);
+            assert_no_edge!(g, 103, 2);
+            assert_no_edge!(g, 103, 101);
+
+            assert_edge!(g, 104, 8);
+            assert_no_edge!(g, 104, 3);
+            assert_no_edge!(g, 104, 102);
         }
 
         #[test]
