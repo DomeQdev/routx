@@ -63,6 +63,17 @@ mod tests {
         };
     }
 
+    fn find_phantom_node(g: &Graph, from_id: i64, to_osm_id: i64) -> Option<i64> {
+        g.get_edges(from_id)
+            .iter()
+            .find(|&e| {
+                g.get_node(e.to)
+                    .map(|n| n.osm_id == to_osm_id)
+                    .unwrap_or(false)
+            })
+            .map(|e| e.to)
+    }
+
     fn check_simple_graph(g: &Graph) {
         //   9
         //   │         8
@@ -110,12 +121,7 @@ mod tests {
         // Check turn restriction -200: no -8 -> -7 -> -3
         {
             assert_no_edge!(g, -8, -7);
-            let phantom_node = g
-                .get_edges(-8)
-                .iter()
-                .find(|&e| g.get_node(e.to).unwrap().osm_id == -7)
-                .unwrap()
-                .to;
+            let phantom_node = find_phantom_node(&g, -8, -7).unwrap();
             assert_edge!(g, -8, phantom_node);
             assert_no_edge!(g, phantom_node, -3);
         }
@@ -127,13 +133,7 @@ mod tests {
         // Check turn restriction: only -1 -> -2 -> -3
         {
             assert_no_edge!(g, -1, -2);
-
-            let phantom_node = g
-                .get_edges(-1)
-                .iter()
-                .find(|&e| g.get_node(e.to).unwrap().osm_id == -2)
-                .unwrap()
-                .to;
+            let phantom_node = find_phantom_node(&g, -1, -2).unwrap();
             assert_edge!(g, -1, phantom_node);
 
             let edges = g.get_edges(phantom_node);
