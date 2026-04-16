@@ -4,7 +4,7 @@
 mod fileformat;
 mod osmformat;
 
-use super::model::{Feature, FeatureType, Relation, RelationMember, Way};
+use super::model::{Feature, FeatureType, Relation, RelationMember, Way, OsmNode};
 use crate::Node;
 
 use protobuf::Message;
@@ -354,11 +354,12 @@ impl Group {
     /// Returns a flattened iterator over all [Features](Feature) in this group.
     fn features(self) -> impl Iterator<Item = Feature> {
         let nodes =
-            Self::nodes(self.primitive_group.nodes, self.coordinate_converter).map(Feature::Node);
+            Self::nodes(self.primitive_group.nodes, self.coordinate_converter, self.string_table.clone()).map(Feature::Node);
 
         let dense_nodes = Self::dense_nodes(
             self.primitive_group.dense.unwrap_or_default(),
             self.coordinate_converter,
+            self.string_table.clone()
         )
         .map(Feature::Node);
 
@@ -376,12 +377,16 @@ impl Group {
     fn nodes(
         raw_nodes: Vec<osmformat::Node>,
         coordinate_converter: CoordinateConverter,
-    ) -> impl Iterator<Item = Node> {
-        raw_nodes.into_iter().map(move |node| Node {
-            id: node.id(),
-            osm_id: node.id(),
-            lat: coordinate_converter.convert_lat(node.lat()),
-            lon: coordinate_converter.convert_lon(node.lon()),
+        string_table: StringTable,
+    ) -> impl Iterator<Item = OsmNode> {
+        raw_nodes.into_iter().map(move |node| OsmNode {
+            node: Node {
+                id: node.id(),
+                osm_id: node.id(),
+                lat: coordinate_converter.convert_lat(node.lat()),
+                lon: coordinate_converter.convert_lon(node.lon()),
+            },
+            tags: collect_tags(&node.keys, &node.vals, &string_table)
         })
     }
 
@@ -389,7 +394,11 @@ impl Group {
     fn dense_nodes(
         raw_dense_nodes: osmformat::DenseNodes,
         coordinate_converter: CoordinateConverter,
-    ) -> impl Iterator<Item = Node> {
+        string_table: StringTable,
+    ) -> impl Iterator<Item = OsmNode> {
+        let mut kv_idx = 0;
+        let keys_vals = raw_dense_nodes.keys_vals;
+
         let ids = raw_dense_nodes.id.into_iter().scan(0, |acc, delta| {
             *acc += delta;
             Some(*acc)
@@ -405,11 +414,31 @@ impl Group {
             Some(coordinate_converter.convert_lon(*acc))
         });
 
-        ids.zip(lats.zip(lons)).map(|(id, (lat, lon))| Node {
-            id,
-            osm_id: id,
-            lat,
-            lon,
+        ids.zip(lats.zip(lons)).map(move |(id, (lat, lon))| {
+            let mut tags = HashMap::new();
+            while kv_idx < keys_vals.len() {
+                let k = keys_vals[kv_idx];
+                if k == 0 {
+                    kv_idx += 1;
+                    break;
+                }
+                let v = keys_vals[kv_idx + 1];
+                kv_idx += 2;
+                tags.insert(
+                    get_string(&string_table, k as u32),
+                    get_string(&string_table, v as u32),
+                );
+            }
+
+            OsmNode {
+                node: Node {
+                    id,
+                    osm_id: id,
+                    lat,
+                    lon,
+                },
+                tags,
+            }
         })
     }
 

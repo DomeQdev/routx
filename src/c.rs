@@ -9,13 +9,11 @@
 use super::*;
 
 use std::borrow::Cow;
-use std::collections::btree_map;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::{forget, ManuallyDrop};
-use std::ptr::null_mut;
 use std::slice;
 
-type CGraphIterator<'a> = btree_map::Values<'a, i64, (Node, Vec<Edge>)>;
+use crate::flat_graph::{FlatNode, MemoryMappedGraph};
 
 type CLogCallback = unsafe extern "C" fn(
     arg: *mut c_void,
@@ -28,7 +26,7 @@ type CFlushCallback = unsafe extern "C" fn(arg: *mut c_void);
 struct CLogger {
     callback: CLogCallback,
     flush_callback: Option<CFlushCallback>,
-    arg: usize, // rust is stupid and `*mut c_void` is not `Send + Sync`
+    arg: usize,
     level: log::LevelFilter,
 }
 
@@ -126,140 +124,8 @@ pub unsafe extern "C" fn routx_graph_delete(ptr: *mut Graph) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_get_nodes(
-    graph: *const Graph,
-    iterator_ptr: *mut *mut CGraphIterator<'_>,
-) -> usize {
-    if let Some(graph) = graph.as_ref() {
-        if !iterator_ptr.is_null() {
-            *iterator_ptr = Box::into_raw(Box::new(graph.0.values()));
-        }
-
-        graph.len()
-    } else {
-        if !iterator_ptr.is_null() {
-            *iterator_ptr = null_mut();
-        }
-
-        0
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_iterator_next(iterator: *mut CGraphIterator<'_>) -> Node {
-    if let Some(iterator) = iterator.as_mut() {
-        if let Some((node, _)) = iterator.next() {
-            return *node;
-        }
-    }
-
-    Node::ZERO
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_iterator_delete(iterator: *mut CGraphIterator<'_>) {
-    if !iterator.is_null() {
-        drop(Box::from_raw(iterator));
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_get_node(graph: *const Graph, id: i64) -> Node {
-    graph
-        .as_ref()
-        .and_then(|g| g.get_node(id))
-        .unwrap_or(Node::ZERO)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_set_node(graph: *mut Graph, node: Node) -> bool {
-    if let Some(graph) = graph.as_mut() {
-        graph.set_node(node)
-    } else {
-        false
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_delete_node(graph: *mut Graph, id: i64) -> bool {
-    if let Some(graph) = graph.as_mut() {
-        graph.delete_node(id)
-    } else {
-        false
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_find_nearest_node(
-    graph: *const Graph,
-    lat: f32,
-    lon: f32,
-) -> Node {
-    graph
-        .as_ref()
-        .and_then(|g| g.find_nearest_node(lat, lon))
-        .unwrap_or(Node::ZERO)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_get_edges(
-    graph: *const Graph,
-    from_id: i64,
-    out_edges: *mut *const Edge,
-) -> usize {
-    if let Some(graph) = graph.as_ref() {
-        let edges = graph.get_edges(from_id);
-        if !out_edges.is_null() {
-            *out_edges = edges.as_ptr();
-        }
-
-        edges.len()
-    } else {
-        if !out_edges.is_null() {
-            *out_edges = null_mut();
-        }
-
-        0
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_get_edge(
-    graph: *const Graph,
-    from_id: i64,
-    to_id: i64,
-) -> f32 {
-    graph
-        .as_ref()
-        .map(|g| g.get_edge(from_id, to_id))
-        .unwrap_or(f32::INFINITY)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_set_edge(graph: *mut Graph, from_id: i64, edge: Edge) -> bool {
-    if let Some(graph) = graph.as_mut() {
-        graph.set_edge(from_id, edge)
-    } else {
-        false
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_delete_edge(
-    graph: *mut Graph,
-    from_id: i64,
-    to_id: i64,
-) -> bool {
-    if let Some(graph) = graph.as_mut() {
-        graph.delete_edge(from_id, to_id)
-    } else {
-        false
-    }
-}
-
 #[repr(C)]
-struct COsmProfilePenalty {
+pub struct COsmProfilePenalty {
     key: *const c_char,
     value: *const c_char,
     penalty: f32,
@@ -268,38 +134,23 @@ struct COsmProfilePenalty {
 #[repr(C)]
 pub struct COsmProfile {
     name: *const c_char,
-
     penalties: *const COsmProfilePenalty,
     penalties_len: usize,
-
     access: *const *const c_char,
     access_len: usize,
-
     disallow_motorroad: bool,
     disable_restrictions: bool,
 }
 
 impl COsmProfile {
-    /// Builds a buffer containing all strings referenced by this Profile.
-    ///
-    /// The layout of the buffer is as follows:
-    /// - 0: name
-    /// - 1..=access_len: access
-    /// - access_len + 1..=access_len + penalties_len * 2: penalty keys and values
     unsafe fn build_string_table(&self) -> Vec<Cow<'_, str>> {
         let mut table = Vec::with_capacity(self.penalties_len * 2 + self.access_len + 1);
-
-        // table[0]: profile name
         table.push(CStr::from_ptr(self.name).to_string_lossy());
-
-        // table[1..=access_len]: access tags
         table.extend(
             slice::from_raw_parts(self.access, self.access_len)
                 .iter()
                 .map(|&access_cstr_ptr| CStr::from_ptr(access_cstr_ptr).to_string_lossy()),
         );
-
-        // table[access_len + 1..=access_len + penalties_len * 2]: penalty keys and values
         table.extend(
             slice::from_raw_parts(self.penalties, self.penalties_len)
                 .iter()
@@ -310,7 +161,6 @@ impl COsmProfile {
                     ]
                 }),
         );
-
         table
     }
 
@@ -379,31 +229,47 @@ impl From<COsmFormat> for osm::FileFormat {
 }
 
 #[repr(C)]
+pub struct CNodeTagFilter {
+    pub key: *const c_char,
+    pub value: *const c_char,
+    pub tags_to_save: *const *const c_char,
+    pub tags_to_save_len: usize,
+}
+
+#[repr(C)]
 pub struct COsmOptions {
     pub profile: *const COsmProfile,
     pub format: COsmFormat,
     pub bbox: [f32; 4],
-}
-
-impl COsmOptions {
-    fn parsed_with_profile<'a>(&self, profile: &'a osm::Profile<'a>) -> osm::Options<'a> {
-        osm::Options {
-            profile,
-            file_format: self.format.into(),
-            bbox: self.bbox,
-        }
-    }
+    pub filters: *const CNodeTagFilter,
+    pub filters_len: usize,
 }
 
 unsafe fn with_parsed_options<F: FnOnce(&osm::Options<'_>) -> R, R>(
     c_options: *const COsmOptions,
     f: F,
 ) -> R {
-    let c_options = c_options
-        .as_ref()
-        .expect("RoutxOsmOptions must not be NULL");
+    let c_options = c_options.as_ref().expect("RoutxOsmOptions must not be NULL");
 
-    // Special profile values to profile reallocation
+    let mut rust_filters = Vec::new();
+    if !c_options.filters.is_null() && c_options.filters_len > 0 {
+        let filters_slice = std::slice::from_raw_parts(c_options.filters, c_options.filters_len);
+        for filter in filters_slice {
+            let key = CStr::from_ptr(filter.key).to_string_lossy().to_string();
+            let val = CStr::from_ptr(filter.value).to_string_lossy().to_string();
+            let mut tags_to_save = Vec::new();
+            let str_slice = std::slice::from_raw_parts(filter.tags_to_save, filter.tags_to_save_len);
+            for &tag_ptr in str_slice {
+                tags_to_save.push(CStr::from_ptr(tag_ptr).to_string_lossy().to_string());
+            }
+            rust_filters.push(osm::NodeTagFilter {
+                key,
+                value: val,
+                tags_to_save,
+            });
+        }
+    }
+
     let predefined_profile = match c_options.profile as usize {
         1 => Some(&osm::CAR_PROFILE),
         2 => Some(&osm::BUS_PROFILE),
@@ -416,18 +282,26 @@ unsafe fn with_parsed_options<F: FnOnce(&osm::Options<'_>) -> R, R>(
     };
 
     if let Some(profile) = predefined_profile {
-        let options = c_options.parsed_with_profile(profile);
+        let options = osm::Options {
+            profile,
+            file_format: c_options.format.into(),
+            bbox: c_options.bbox,
+            node_tag_filters: &rust_filters,
+        };
         f(&options)
     } else {
-        let c_profile = c_options
-            .profile
-            .as_ref()
-            .expect("RoutxOsmOptions.profile must not be NULL");
+        let c_profile = c_options.profile.as_ref().expect("Profile must not be NULL");
         let profile_strings = c_profile.build_string_table();
         let profile_penalties = c_profile.penalties_as_rust(&profile_strings);
         let profile_access = c_profile.access_as_rust(&profile_strings);
         let profile = c_profile.as_rust(&profile_strings[0], &profile_penalties, &profile_access);
-        let options = c_options.parsed_with_profile(&profile);
+        
+        let options = osm::Options {
+            profile: &profile,
+            file_format: c_options.format.into(),
+            bbox: c_options.bbox,
+            node_tag_filters: &rust_filters,
+        };
         f(&options)
     }
 }
@@ -440,9 +314,7 @@ pub unsafe extern "C" fn routx_graph_add_from_osm_file(
 ) -> bool {
     if let (Some(graph), c_options, c_filename) = (
         graph.as_mut(),
-        c_options
-            .as_ref()
-            .expect("RoutxOsmOptions must not be NULL"),
+        c_options.as_ref().expect("RoutxOsmOptions must not be NULL"),
         CStr::from_ptr(c_filename),
     ) {
         let filename = str::from_utf8_unchecked(c_filename.to_bytes());
@@ -462,32 +334,85 @@ pub unsafe extern "C" fn routx_graph_add_from_osm_file(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_graph_add_from_osm_memory(
-    graph: *mut Graph,
-    c_options: *const COsmOptions,
-    content: *const u8,
-    content_len: usize,
+pub unsafe extern "C" fn routx_graph_write_to_routx_file(
+    graph: *const Graph,
+    c_filename: *const c_char,
 ) -> bool {
-    if let (Some(graph), c_options) = (
-        graph.as_mut(),
-        c_options
-            .as_ref()
-            .expect("RoutxOsmOptions must not be NULL"),
-    ) {
-        let content = std::slice::from_raw_parts(content, content_len);
-        let result = with_parsed_options(c_options, |options| {
-            osm::add_features_from_buffer(graph, options, content)
-        });
-        match result {
-            Ok(_) => true,
-            Err(e) => {
-                log::error!(target: "routx", "<memory>: {}", e);
-                false
+    if let (Some(graph), c_filename) = (graph.as_ref(), CStr::from_ptr(c_filename)) {
+        let filename = str::from_utf8_unchecked(c_filename.to_bytes());
+        let kd_tree = KDTree::build_from_graph(graph);
+        
+        if let Ok(file) = std::fs::File::create(filename) {
+            let writer = std::io::BufWriter::new(file);
+            match crate::builder::build_memory_mapped_graph(graph, kd_tree.as_ref(), writer) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::error!(target: "routx", "Error writing file {}: {}", filename, e);
+                    false
+                }
             }
+        } else {
+            false
         }
     } else {
-        true
+        false
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn routx_mmap_init(data: *const u8, len: usize) -> *mut MemoryMappedGraph<'static> {
+    let slice = std::slice::from_raw_parts(data, len);
+    match MemoryMappedGraph::new(slice) {
+        Ok(g) => Box::into_raw(Box::new(g)),
+        Err(e) => {
+            log::error!(target: "routx", "mmap init error: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn routx_mmap_destroy(ptr: *mut MemoryMappedGraph<'static>) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn routx_mmap_get_node(
+    graph: *const MemoryMappedGraph<'static>,
+    node_idx: u32,
+) -> *const FlatNode {
+    graph.as_ref()
+        .and_then(|g| g.get_node(node_idx))
+        .map(|n| n as *const _)
+        .unwrap_or(std::ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn routx_mmap_find_nodes_within_radius(
+    graph: *const MemoryMappedGraph<'static>,
+    lat: f32,
+    lon: f32,
+    radius_m: f32,
+    out_len: *mut usize,
+) -> *mut u32 {
+    let graph = match graph.as_ref() {
+        Some(g) => g,
+        None => {
+            if !out_len.is_null() { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    
+    let mut nodes = graph.find_nodes_within_radius(lat, lon, radius_m);
+    nodes.shrink_to_fit();
+    let ptr = nodes.as_mut_ptr();
+    if !out_len.is_null() {
+        *out_len = nodes.len();
+    }
+    std::mem::forget(nodes);
+    ptr
 }
 
 #[repr(C)]
@@ -499,7 +424,7 @@ pub enum CRouteResultType {
 
 #[repr(C)]
 pub struct CRouteResultOk {
-    pub nodes: *mut i64,
+    pub nodes: *mut u32,
     pub len: u32,
     pub capacity: u32,
 }
@@ -507,7 +432,7 @@ pub struct CRouteResultOk {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct CRouteResultInvalidReference {
-    pub invalid_node_id: i64,
+    pub invalid_node_idx: u32,
 }
 
 #[repr(C)]
@@ -524,14 +449,11 @@ pub struct CRouteResult {
 }
 
 impl CRouteResult {
-    fn ok(mut nodes: Vec<i64>) -> Self {
+    fn ok(mut nodes: Vec<u32>) -> Self {
         nodes.shrink_to_fit();
         let ptr = nodes.as_mut_ptr();
         let len = nodes.len().try_into().expect("route length overflow");
-        let capacity = nodes
-            .capacity()
-            .try_into()
-            .expect("route capacity overflow");
+        let capacity = nodes.capacity().try_into().expect("route capacity overflow");
         forget(nodes);
 
         CRouteResult {
@@ -546,10 +468,10 @@ impl CRouteResult {
         }
     }
 
-    fn invalid_reference(invalid_node_id: i64) -> Self {
+    fn invalid_reference(invalid_node_idx: u32) -> Self {
         CRouteResult {
             inner: CRouteResultInner {
-                invalid_reference: CRouteResultInvalidReference { invalid_node_id },
+                invalid_reference: CRouteResultInvalidReference { invalid_node_idx },
             },
             type_: CRouteResultType::InvalidReference,
         }
@@ -564,56 +486,38 @@ impl CRouteResult {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_find_route(
-    graph: *const Graph,
-    from_id: i64,
-    to_id: i64,
+pub unsafe extern "C" fn routx_mmap_find_route(
+    graph: *const MemoryMappedGraph<'static>,
+    from_idx: u32,
+    to_idx: u32,
     max_steps: usize,
 ) -> CRouteResult {
     if let Some(graph) = graph.as_ref() {
-        match find_route(graph, from_id, to_id, max_steps) {
+        match find_route(graph, from_idx, to_idx, max_steps) {
             Ok(nodes) => CRouteResult::ok(nodes),
             Err(astar::AStarError::InvalidReference(ref_)) => CRouteResult::invalid_reference(ref_),
             Err(astar::AStarError::StepLimitExceeded) => CRouteResult::empty(),
         }
     } else {
-        CRouteResult {
-            inner: CRouteResultInner {
-                ok: ManuallyDrop::new(CRouteResultOk {
-                    nodes: null_mut(),
-                    len: 0,
-                    capacity: 0,
-                }),
-            },
-            type_: CRouteResultType::Ok,
-        }
+        CRouteResult::empty()
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_find_route_without_turn_around(
-    graph: *const Graph,
-    from_id: i64,
-    to_id: i64,
+pub unsafe extern "C" fn routx_mmap_find_route_without_turn_around(
+    graph: *const MemoryMappedGraph<'static>,
+    from_idx: u32,
+    to_idx: u32,
     max_steps: usize,
 ) -> CRouteResult {
     if let Some(graph) = graph.as_ref() {
-        match find_route_without_turn_around(graph, from_id, to_id, max_steps) {
+        match find_route_without_turn_around(graph, from_idx, to_idx, max_steps) {
             Ok(nodes) => CRouteResult::ok(nodes),
             Err(astar::AStarError::InvalidReference(ref_)) => CRouteResult::invalid_reference(ref_),
             Err(astar::AStarError::StepLimitExceeded) => CRouteResult::empty(),
         }
     } else {
-        CRouteResult {
-            inner: CRouteResultInner {
-                ok: ManuallyDrop::new(CRouteResultOk {
-                    nodes: null_mut(),
-                    len: 0,
-                    capacity: 0,
-                }),
-            },
-            type_: CRouteResultType::Ok,
-        }
+        CRouteResult::empty()
     }
 }
 
@@ -630,45 +534,15 @@ pub unsafe extern "C" fn routx_route_result_delete(result: CRouteResult) {
                 ));
             }
         }
-
-        CRouteResultType::InvalidReference => {
-            // Nothing to free
-        }
-
-        CRouteResultType::StepLimitExceeded => {
-            // Nothing to free
-        }
+        _ => {}
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_kd_tree_new(graph: *const Graph) -> *mut KDTree {
-    if let Some(graph) = graph.as_ref() {
-        if let Some(kd) = KDTree::build_from_graph(graph) {
-            return Box::into_raw(Box::new(kd));
-        }
-    }
-
-    null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_kd_tree_delete(ptr: *mut KDTree) {
+pub unsafe extern "C" fn routx_free_u32_array(ptr: *mut u32, len: usize) {
     if !ptr.is_null() {
-        drop(Box::from_raw(ptr));
+        drop(Vec::from_raw_parts(ptr, len, len));
     }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn routx_kd_tree_find_nearest_node(
-    kd_tree: *const KDTree,
-    lat: f32,
-    lon: f32,
-) -> Node {
-    kd_tree
-        .as_ref()
-        .and_then(|kd| Some(kd.find_nearest_node(lat, lon)))
-        .unwrap_or(Node::ZERO)
 }
 
 #[unsafe(no_mangle)]

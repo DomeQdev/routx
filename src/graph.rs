@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{earth_distance, Edge, Node};
+use std::collections::HashMap;
 use std::collections::btree_map::{BTreeMap, Entry};
 
 /// Represents an OpenStreetMap network as a set of [Nodes](Node)
 /// and [Edges](Edge) between them.
+///
+/// The second value in the `HashMap` tuple allows temporarily storing
+/// filtered tags for specific nodes that the user requested to keep.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct Graph(pub BTreeMap<i64, (Node, Vec<Edge>)>);
+pub struct Graph(
+    pub BTreeMap<i64, (Node, Vec<Edge>)>,
+    pub HashMap<i64, HashMap<String, String>>
+);
 
 impl Graph {
     /// Creates a new empty graph.
@@ -42,9 +49,10 @@ impl Graph {
         N: IntoIterator<Item = Node>,
         E: IntoIterator<Item = (i64, i64, f32)>,
     {
-        let mut g = Graph(BTreeMap::from_iter(
-            nodes.into_iter().map(|n| (n.id, (n, vec![]))),
-        ));
+        let mut g = Graph(
+            BTreeMap::from_iter(nodes.into_iter().map(|n| (n.id, (n, vec![])))),
+            HashMap::new()
+        );
 
         edges.into_iter().for_each(|(from, to, cost)| {
             g.set_edge(from, Edge { to: to, cost });
@@ -93,6 +101,7 @@ impl Graph {
     ///
     /// Returns `true` if a node was deleted, `false` if no such node existed.
     pub fn delete_node(&mut self, id: i64) -> bool {
+        self.1.remove(&id); // Remove any tags associated with this node
         self.0.remove(&id).is_some()
     }
 

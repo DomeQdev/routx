@@ -35,6 +35,13 @@ pub mod pbf {
     pub use super::reader::pbf::Error;
 }
 
+#[derive(Debug, Clone)]
+pub struct NodeTagFilter {
+    pub key: String,
+    pub value: String,
+    pub tags_to_save: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::Graph;
@@ -152,6 +159,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Xml,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -170,6 +178,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Unknown,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -188,6 +197,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::XmlGz,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -206,6 +216,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Unknown,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -224,6 +235,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::XmlBz2,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -242,6 +254,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Unknown,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -260,6 +273,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Pbf,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g
@@ -278,6 +292,7 @@ mod tests {
                 profile: &CAR_PROFILE,
                 file_format: FileFormat::Unknown,
                 bbox: [0.0; 4],
+                node_tag_filters: &[],
             };
             add_features_from_buffer(&mut g, &options, DATA).unwrap();
             g

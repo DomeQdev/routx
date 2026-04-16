@@ -110,6 +110,9 @@ pub struct Options<'a> {
     /// Filter features by a specific bounding box. In order: left (min lon), bottom (min lat),
     /// right (max lon), top (max lat). Ignored if all values are set to zero.
     pub bbox: [f32; 4],
+
+    /// Tags to save from nodes
+    pub node_tag_filters: &'a [super::NodeTagFilter],
 }
 
 /// Trait alias for objects which can stream [osm features](model::Feature)

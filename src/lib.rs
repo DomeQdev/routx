@@ -16,6 +16,7 @@
 //!     profile: &routx::osm::CAR_PROFILE,
 //!     file_format: routx::osm::FileFormat::Unknown,
 //!     bbox: [0.0; 4],
+//!     node_tag_filters: &[],
 //! };
 //! routx::osm::add_features_from_file(
 //!     &mut g,
@@ -32,16 +33,20 @@
 //! ```
 
 mod astar;
+pub mod builder;
 pub mod c;
 mod distance;
 mod graph;
 mod kd;
 pub mod osm;
+pub mod flat_graph;
 
 pub use astar::{find_route, find_route_without_turn_around, AStarError, DEFAULT_STEP_LIMIT};
+pub use builder::build_memory_mapped_graph;
 pub use distance::earth_distance;
 pub use graph::Graph;
 pub use kd::KDTree;
+pub use flat_graph::MemoryMappedGraph;
 
 /// Represents an element of the [Graph].
 ///

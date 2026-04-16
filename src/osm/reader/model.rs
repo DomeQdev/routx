@@ -4,6 +4,12 @@
 use crate::Node;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OsmNode {
+    pub node: Node,
+    pub tags: HashMap<String, String>,
+}
+
 /// Represents an [OSM way](https://wiki.openstreetmap.org/wiki/Way).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Way {
@@ -49,7 +55,7 @@ pub struct Relation {
 /// Union over all possible [OSM features/elements](https://wiki.openstreetmap.org/wiki/Elements).
 #[derive(Debug, Clone)]
 pub enum Feature {
-    Node(Node),
+    Node(OsmNode),
     Way(Way),
     Relation(Relation),
 }

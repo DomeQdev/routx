@@ -163,7 +163,7 @@ impl<R: io::BufRead> Reader<IoParser<R>> {
     }
 }
 
-fn parse_node(start: quick_xml::events::BytesStart<'_>) -> Option<Node> {
+fn parse_node(start: quick_xml::events::BytesStart<'_>) -> Option<model::OsmNode> {
     let mut id: i64 = 0;
     let mut lat = f32::NAN;
     let mut lon = f32::NAN;
@@ -200,11 +200,14 @@ fn parse_node(start: quick_xml::events::BytesStart<'_>) -> Option<Node> {
         log::warn!(target: "routx::osm", "node {} has missing or invalid lon - skipping node", id);
         None
     } else {
-        Some(Node {
-            id: id,
-            osm_id: id,
-            lat: lat,
-            lon: lon,
+        Some(model::OsmNode {
+            node: Node {
+                id,
+                osm_id: id,
+                lat,
+                lon,
+            },
+            tags: HashMap::new(),
         })
     }
 }
@@ -225,7 +228,7 @@ fn parse_way(start: quick_xml::events::BytesStart<'_>) -> Option<model::Way> {
 
     if id != 0 {
         Some(model::Way {
-            id: id,
+            id,
             nodes: Vec::default(),
             tags: HashMap::default(),
         })
@@ -252,7 +255,7 @@ fn parse_relation(start: quick_xml::events::BytesStart<'_>) -> Option<model::Rel
 
     if id != 0 {
         Some(model::Relation {
-            id: id,
+            id,
             members: Vec::default(),
             tags: HashMap::default(),
         })
@@ -391,7 +394,7 @@ fn feature_tags<'a>(
 ) -> Option<(i64, &'a mut HashMap<String, String>)> {
     match f {
         None => None,
-        Some(model::Feature::Node(_)) => None,
+        Some(model::Feature::Node(ref mut n)) => Some((n.node.id, &mut n.tags)),
         Some(model::Feature::Way(ref mut w)) => Some((w.id, &mut w.tags)),
         Some(model::Feature::Relation(ref mut r)) => Some((r.id, &mut r.tags)),
     }
@@ -647,7 +650,7 @@ mod tests {
 
         for f in features {
             match f {
-                Ok(Feature::Node(n)) => nodes.push(n),
+                Ok(Feature::Node(n)) => nodes.push(n.node),
                 Ok(Feature::Way(w)) => ways.push(w),
                 Ok(Feature::Relation(r)) => relations.push(r),
                 Err(e) => return Err(e),

@@ -1,6 +1,7 @@
 // (c) Copyright 2025 Mikołaj Kuranowski
 // SPDX-License-Identifier: MIT
 
+use std::collections::HashMap;
 use crate::{earth_distance, Graph, Node};
 
 /// KDTree implements the [k-d tree data structure](https://en.wikipedia.org/wiki/K-d_tree),
@@ -35,7 +36,43 @@ pub struct KDTree {
 }
 
 impl KDTree {
-    /// Finds the closest canonical (`id == osm_id`) [Node] to the given position.
+    pub fn flatten(&self, node_id_to_idx: &HashMap<i64, u32>) -> Vec<crate::flat_graph::FlatKDNode> {
+        let mut flat_tree = Vec::new();
+        self.flatten_impl(node_id_to_idx, &mut flat_tree);
+        flat_tree
+    }
+
+    fn flatten_impl(&self, node_id_to_idx: &HashMap<i64, u32>, out: &mut Vec<crate::flat_graph::FlatKDNode>) -> u32 {
+        let current_idx = out.len() as u32;
+        
+        let node_idx = *node_id_to_idx
+            .get(&self.pivot.id)
+            .expect("KDTree contains a node ID that is missing from the dense Graph mapping");
+
+        out.push(crate::flat_graph::FlatKDNode {
+            node_idx,
+            left_idx: crate::flat_graph::NULL_IDX,
+            right_idx: crate::flat_graph::NULL_IDX,
+        });
+
+        let left_idx = if let Some(ref left) = self.left {
+            left.flatten_impl(node_id_to_idx, out)
+        } else {
+            crate::flat_graph::NULL_IDX
+        };
+
+        let right_idx = if let Some(ref right) = self.right {
+            right.flatten_impl(node_id_to_idx, out)
+        } else {
+            crate::flat_graph::NULL_IDX
+        };
+
+        out[current_idx as usize].left_idx = left_idx;
+        out[current_idx as usize].right_idx = right_idx;
+
+        current_idx
+    }
+
     pub fn find_nearest_node(&self, lat: f32, lon: f32) -> Node {
         self.find_nearest_node_impl(lat, lon, false).0
     }
