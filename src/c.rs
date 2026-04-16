@@ -491,8 +491,9 @@ pub unsafe extern "C" fn routx_mmap_find_route(
     from_idx: u32,
     to_idx: u32,
     max_steps: usize,
-) -> CRouteResult {
-    if let Some(graph) = graph.as_ref() {
+    out_result: *mut CRouteResult,
+) {
+    let res = if let Some(graph) = graph.as_ref() {
         match find_route(graph, from_idx, to_idx, max_steps) {
             Ok(nodes) => CRouteResult::ok(nodes),
             Err(astar::AStarError::InvalidReference(ref_)) => CRouteResult::invalid_reference(ref_),
@@ -500,6 +501,9 @@ pub unsafe extern "C" fn routx_mmap_find_route(
         }
     } else {
         CRouteResult::empty()
+    };
+    if !out_result.is_null() {
+        *out_result = res;
     }
 }
 
@@ -509,8 +513,9 @@ pub unsafe extern "C" fn routx_mmap_find_route_without_turn_around(
     from_idx: u32,
     to_idx: u32,
     max_steps: usize,
-) -> CRouteResult {
-    if let Some(graph) = graph.as_ref() {
+    out_result: *mut CRouteResult,
+) {
+    let res = if let Some(graph) = graph.as_ref() {
         match find_route_without_turn_around(graph, from_idx, to_idx, max_steps) {
             Ok(nodes) => CRouteResult::ok(nodes),
             Err(astar::AStarError::InvalidReference(ref_)) => CRouteResult::invalid_reference(ref_),
@@ -518,6 +523,58 @@ pub unsafe extern "C" fn routx_mmap_find_route_without_turn_around(
         }
     } else {
         CRouteResult::empty()
+    };
+    if !out_result.is_null() {
+        *out_result = res;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn routx_build_routx_file(
+    c_options: *const COsmOptions,
+    c_input_filename: *const c_char,
+    c_output_filename: *const c_char,
+) -> bool {
+    let (c_options, input_filename, output_filename) = match (
+        c_options.as_ref(),
+        CStr::from_ptr(c_input_filename).to_str(),
+        CStr::from_ptr(c_output_filename).to_str(),
+    ) {
+        (Some(opts), Ok(input), Ok(output)) => (opts, input, output),
+        _ => {
+            log::error!(target: "routx", "Invalid arguments passed to routx_build_routx_file");
+            return false;
+        }
+    };
+
+    let mut graph = Graph::default();
+
+    let load_result = with_parsed_options(c_options, |options| {
+        osm::add_features_from_file(&mut graph, options, input_filename)
+    });
+
+    if let Err(e) = load_result {
+        log::error!(target: "routx", "Failed to load OSM file {}: {}", input_filename, e);
+        return false;
+    }
+
+    let kd_tree = KDTree::build_from_graph(&graph);
+
+    match std::fs::File::create(output_filename) {
+        Ok(file) => {
+            let writer = std::io::BufWriter::new(file);
+            match crate::builder::build_memory_mapped_graph(&graph, kd_tree.as_ref(), writer) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::error!(target: "routx", "Failed to write routx file: {}", e);
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            log::error!(target: "routx", "Failed to create output file {}: {}", output_filename, e);
+            false
+        }
     }
 }
 
