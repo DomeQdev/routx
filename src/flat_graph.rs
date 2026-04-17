@@ -251,15 +251,15 @@ impl<'a> MemoryMappedGraph<'a> {
             let search_left = if lon_divides { lon < node.lon } else { lat < node.lat };
 
             if search_left {
-                stack.push((kd_node.left_idx, !lon_divides));
                 if axis_dist <= radius_meters {
                     stack.push((kd_node.right_idx, !lon_divides));
                 }
+                stack.push((kd_node.left_idx, !lon_divides));
             } else {
-                stack.push((kd_node.right_idx, !lon_divides));
                 if axis_dist <= radius_meters {
                     stack.push((kd_node.left_idx, !lon_divides));
                 }
+                stack.push((kd_node.right_idx, !lon_divides));
             }
         }
 
