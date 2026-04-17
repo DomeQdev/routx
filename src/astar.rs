@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::BinaryHeap;
+use rustc_hash::FxHashMap;
 
-use crate::earth_distance;
-use crate::flat_graph::{MemoryMappedGraph, NULL_IDX};
+use crate::distance::fast_distance;
+use crate::flat_graph::MemoryMappedGraph;
 
 /// Recommended number of allowed node expansions in [find_route](crate::find_route) and
 /// [find_route_without_turn_around](crate::find_route_without_turn_around)
@@ -51,7 +52,7 @@ struct QueueItem {
     /// Cost required to reach [QueueItem::node_idx]
     cost: f32,
 
-    /// A* order heuristic, cost + earth_distance between [QueueItem::node_idx] and the destination.
+    /// A* order heuristic, cost + fast_distance between [QueueItem::node_idx] and the destination.
     /// Lower bound on the cost of the entire journey.
     score: f32,
 }
@@ -82,12 +83,12 @@ impl Ord for QueueItem {
     }
 }
 
-fn reconstruct_path(came_from: &[u32], mut current: u32) -> Vec<u32> {
+fn reconstruct_path(came_from: &FxHashMap<u32, u32>, mut current: u32) -> Vec<u32> {
     let mut path = vec![current];
 
-    while came_from[current as usize] != NULL_IDX {
-        current = came_from[current as usize];
-        path.push(current);
+    while let Some(&prev) = came_from.get(&current) {
+        path.push(prev);
+        current = prev;
     }
 
     path.reverse();
@@ -117,19 +118,20 @@ fn find_route_inner(
 
     let from_node = g.get_node(from_idx).unwrap();
 
-    let mut known_costs = vec![f32::INFINITY; nodes_count];
-    let mut came_from = vec![NULL_IDX; nodes_count];
+    // Use FxHashMap to avoid massive allocations when evaluating massive graphs
+    let mut known_costs: FxHashMap<u32, f32> = FxHashMap::default();
+    let mut came_from: FxHashMap<u32, u32> = FxHashMap::default();
     
     let mut queue: BinaryHeap<QueueItem> = BinaryHeap::new();
     let mut steps: usize = 0;
 
     // Push the `from` node to the queue
-    known_costs[from_idx as usize] = 0.0;
+    known_costs.insert(from_idx, 0.0);
     queue.push(QueueItem {
         node_idx: from_idx,
         prev_osm_id: 0,
         cost: 0.0,
-        score: earth_distance(from_node.lat, from_node.lon, target_lat, target_lon),
+        score: fast_distance(from_node.lat, from_node.lon, target_lat, target_lon),
     });
 
     // Expand elements from the queue until either the `to` node is reached,
@@ -145,7 +147,8 @@ fn find_route_inner(
         }
 
         // We might keep multiple items in the queue for the same node.
-        if item.cost > known_costs[item.node_idx as usize] {
+        let current_known_cost = *known_costs.get(&item.node_idx).unwrap_or(&f32::INFINITY);
+        if item.cost > current_known_cost {
             continue;
         }
 
@@ -172,15 +175,17 @@ fn find_route_inner(
 
             // Check if this is the cheapest way to the neighbor
             let new_cost = item.cost + edge.cost;
-            if new_cost < known_costs[neighbor_idx as usize] {
-                known_costs[neighbor_idx as usize] = new_cost;
-                came_from[neighbor_idx as usize] = item.node_idx;
+            let neighbor_known_cost = *known_costs.get(&neighbor_idx).unwrap_or(&f32::INFINITY);
+            
+            if new_cost < neighbor_known_cost {
+                known_costs.insert(neighbor_idx, new_cost);
+                came_from.insert(neighbor_idx, item.node_idx);
                 
                 queue.push(QueueItem {
                     node_idx: neighbor_idx,
                     prev_osm_id: curr_node.osm_id,
                     cost: new_cost,
-                    score: new_cost + earth_distance(neighbor.lat, neighbor.lon, target_lat, target_lon),
+                    score: new_cost + fast_distance(neighbor.lat, neighbor.lon, target_lat, target_lon),
                 });
             }
         }

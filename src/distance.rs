@@ -26,6 +26,22 @@ pub fn earth_distance(lat1: f32, lon1: f32, lat2: f32, lon2: f32) -> f32 {
     (EARTH_DIAMETER * h.sqrt().asin()) as f32
 }
 
+/// Fast equirectangular approximation for distances.
+/// Operates without heavy trigonometric functions (only one cos and sqrt),
+/// offering massive performance improvements for A* heuristics and KD-Tree searches.
+/// Returns the result in kilometers.
+pub fn fast_distance(lat1: f32, lon1: f32, lat2: f32, lon2: f32) -> f32 {
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let lon1_rad = lon1.to_radians();
+    let lon2_rad = lon2.to_radians();
+
+    let x = (lon2_rad - lon1_rad) * ((lat1_rad + lat2_rad) / 2.0).cos();
+    let y = lat2_rad - lat1_rad;
+
+    (EARTH_RADIUS as f32) * (x * x + y * y).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

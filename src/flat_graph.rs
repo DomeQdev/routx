@@ -36,17 +36,41 @@ pub struct Header {
     pub _pad5: u32,             // offset: 84
 }                               // total size: 88 bytes
 
-/// Flat representation of a node (Node). Size: 32 bytes.
+/// Flat representation of a node (Node). Size: 24 bytes (Bit-packed for compression).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FlatNode {
-    pub osm_id: i64,            // 8 bajtów
-    pub lat: f32,               // 4 bajty
-    pub lon: f32,               // 4 bajty
-    pub first_edge_idx: u32,    // 4 bajty
-    pub edge_count: u32,        // 4 bajty
-    pub first_tag_idx: u32,     // 4 bajty
-    pub tag_count: u32,         // 4 bajty
+    pub osm_id: i64,            // 8 bytes
+    pub lat: f32,               // 4 bytes
+    pub lon: f32,               // 4 bytes
+    
+    /// Bit-packed info: first 27 bits for first_edge_idx, last 5 bits for edge_count
+    pub edge_info: u32,         // 4 bytes
+    
+    /// Bit-packed info: first 27 bits for first_tag_idx, last 5 bits for tag_count
+    pub tag_info: u32,          // 4 bytes
+}
+
+impl FlatNode {
+    #[inline]
+    pub fn edge_count(&self) -> u32 {
+        self.edge_info & 0x1F
+    }
+
+    #[inline]
+    pub fn first_edge_idx(&self) -> u32 {
+        self.edge_info >> 5
+    }
+
+    #[inline]
+    pub fn tag_count(&self) -> u32 {
+        self.tag_info & 0x1F
+    }
+
+    #[inline]
+    pub fn first_tag_idx(&self) -> u32 {
+        self.tag_info >> 5
+    }
 }
 
 /// Flat representation of an edge (Edge). Size: 8 bytes.
@@ -156,15 +180,15 @@ impl<'a> MemoryMappedGraph<'a> {
     /// Retrieves Edges for a given Node
     #[inline]
     pub fn get_edges(&self, node: &FlatNode) -> &[FlatEdge] {
-        let start = node.first_edge_idx as usize;
-        let end = start + node.edge_count as usize;
+        let start = node.first_edge_idx() as usize;
+        let end = start + node.edge_count() as usize;
         &self.edges[start..end]
     }
 
     /// Iterates over decoded Node Tags (Returns Strings: key, value)
     pub fn get_tags(&self, node: &FlatNode) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
-        let start = node.first_tag_idx as usize;
-        let end = start + node.tag_count as usize;
+        let start = node.first_tag_idx() as usize;
+        let end = start + node.tag_count() as usize;
         self.tags[start..end].iter().map(move |tag| {
             let key = self.get_string(tag.key_string_offset);
             let val = self.get_string(tag.val_string_offset);
@@ -209,19 +233,19 @@ impl<'a> MemoryMappedGraph<'a> {
             let kd_node = &self.kd_tree[kd_idx as usize];
             let node = &self.nodes[kd_node.node_idx as usize];
 
-            // Straight-line distance (haversine)
-            let dist = crate::earth_distance(lat, lon, node.lat, node.lon);
+            // Use fast_distance for KD-Tree traversal and distance checking
+            let dist = crate::distance::fast_distance(lat, lon, node.lat, node.lon);
             
-            // earth_distance returns the result in kilometers, convert to meters
+            // fast_distance returns the result in kilometers, convert to meters
             if dist * 1000.0 <= radius_meters {
                 result.push(kd_node.node_idx);
             }
 
             // Distance to the splitting axis
             let axis_dist = if lon_divides {
-                crate::earth_distance(lat, lon, lat, node.lon) * 1000.0
+                crate::distance::fast_distance(lat, lon, lat, node.lon) * 1000.0
             } else {
-                crate::earth_distance(lat, lon, node.lat, lon) * 1000.0
+                crate::distance::fast_distance(lat, lon, node.lat, lon) * 1000.0
             };
 
             let search_left = if lon_divides { lon < node.lon } else { lat < node.lat };

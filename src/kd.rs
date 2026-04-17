@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::HashMap;
-use crate::{earth_distance, Graph, Node};
+use crate::{Graph, Node};
+use crate::distance::fast_distance;
 
 /// KDTree implements the [k-d tree data structure](https://en.wikipedia.org/wiki/K-d_tree),
 /// which can be used to speed up nearest-neighbor search for large datasets.
@@ -12,7 +13,7 @@ use crate::{earth_distance, Graph, Node};
 /// A k-d tree can help with that, trading memory usage for CPU time.
 ///
 /// This implementation assumes euclidean geometry, even though the default distance function
-/// used is [earth_distance]. This results in undefined behavior when points
+/// used is [fast_distance]. This results in undefined behavior when points
 /// are close to the ante meridian (180°/-180° longitude) or poles (90°/-90° latitude),
 /// or when the data spans multiple continents.
 ///
@@ -80,7 +81,7 @@ impl KDTree {
     fn find_nearest_node_impl(&self, lat: f32, lon: f32, lon_divides: bool) -> (Node, f32) {
         // Start by assuming that pivot is the closest
         let mut best = self.pivot;
-        let mut best_dist = earth_distance(lat, lon, best.lat, best.lon);
+        let mut best_dist = fast_distance(lat, lon, best.lat, best.lon);
 
         // Select which branch to recurse into first
         let first_left = if lon_divides {
@@ -112,7 +113,7 @@ impl KDTree {
             } else {
                 (self.pivot.lat, lon)
             };
-            let dist_to_axis = earth_distance(lat, lon, axis_lat, axis_lon);
+            let dist_to_axis = fast_distance(lat, lon, axis_lat, axis_lon);
 
             if dist_to_axis < best_dist {
                 let (alt, alt_dist) = branch.find_nearest_node_impl(lat, lon, !lon_divides);

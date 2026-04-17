@@ -80,14 +80,26 @@ pub fn build_memory_mapped_graph<W: Write>(
             }
         }
 
+        // Clamp counts to 5 bits maximum (31 elements) to support bit-packing format
+        let clamped_edge_count = std::cmp::min(edge_count, 31);
+        if edge_count > 31 {
+            log::warn!(target: "routx::builder", "Node {} exceeds max packed edge capacity ({} > 31). Truncating.", old_id, edge_count);
+        }
+        
+        let clamped_tag_count = std::cmp::min(tag_count, 31);
+        if tag_count > 31 {
+            log::warn!(target: "routx::builder", "Node {} exceeds max packed tag capacity ({} > 31). Truncating.", old_id, tag_count);
+        }
+
+        let edge_info = (first_edge_idx << 5) | clamped_edge_count;
+        let tag_info = (first_tag_idx << 5) | clamped_tag_count;
+
         flat_nodes.push(FlatNode {
             osm_id: node.osm_id,
             lat: node.lat,
             lon: node.lon,
-            first_edge_idx,
-            edge_count,
-            first_tag_idx,
-            tag_count,
+            edge_info,
+            tag_info,
         });
     }
 
