@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -115,94 +115,142 @@ pub struct Options<'a> {
     pub node_tag_filters: &'a [super::NodeTagFilter],
 }
 
-/// Trait alias for objects which can stream [osm features](model::Feature)
-/// from an underlying source - alias for `IntoIterator<Item=Result<model::Feature, Error>>`.
-trait FeatureReader: IntoIterator<Item = Result<model::Feature, Self::Error>> {
-    type Error: std::error::Error;
-}
-
-impl<E: std::error::Error, I> FeatureReader for I
+/// Helper function to open a file and run a callback over its features.
+/// This allows us to re-open the file multiple times for Two-Pass architecture.
+fn with_file_iterator<P: AsRef<Path>, F, T>(path: P, format: FileFormat, mut f: F) -> Result<T, Error>
 where
-    I: IntoIterator<Item = Result<model::Feature, E>>,
+    F: FnMut(&mut dyn Iterator<Item = Result<model::Feature, Error>>) -> Result<T, Error>,
 {
-    type Error = E;
+    let mut file = File::open(path.as_ref())?;
+    
+    let detected_format = if format == FileFormat::Unknown {
+        let mut header = [0u8; 8];
+        let bytes_read = file.read(&mut header)?;
+        file.seek(io::SeekFrom::Start(0))?;
+        FileFormat::detect(&header[..bytes_read])
+    } else {
+        format
+    };
+
+    let b = io::BufReader::new(file);
+
+    match detected_format {
+        FileFormat::Unknown => Err(Error::UnknownFileFormat),
+        FileFormat::Xml => {
+            let mut iter = xml::features_from_file(b).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::XmlGz => {
+            let d = flate2::bufread::MultiGzDecoder::new(b);
+            let mut iter = xml::features_from_file(io::BufReader::new(d)).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::XmlBz2 => {
+            let d = bzip2::bufread::MultiBzDecoder::new(b);
+            let mut iter = xml::features_from_file(io::BufReader::new(d)).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::Pbf => {
+            let mut iter = pbf::features_from_file(b).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+    }
 }
 
-/// Parse OSM features from a reader into a [Graph] as per the provided [Options].
+/// Helper function to read from a buffer and run a callback over its features.
+fn with_buffer_iterator<F, T>(data: &[u8], format: FileFormat, mut f: F) -> Result<T, Error>
+where
+    F: FnMut(&mut dyn Iterator<Item = Result<model::Feature, Error>>) -> Result<T, Error>,
+{
+    let detected_format = if format == FileFormat::Unknown {
+        FileFormat::detect(data)
+    } else {
+        format
+    };
+
+    match detected_format {
+        FileFormat::Unknown => Err(Error::UnknownFileFormat),
+        FileFormat::Xml => {
+            let mut iter = xml::features_from_buffer(data).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::XmlGz => {
+            let d = flate2::bufread::MultiGzDecoder::new(io::Cursor::new(data));
+            let mut iter = xml::features_from_file(io::BufReader::new(d)).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::XmlBz2 => {
+            let d = bzip2::bufread::MultiBzDecoder::new(io::Cursor::new(data));
+            let mut iter = xml::features_from_file(io::BufReader::new(d)).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+        FileFormat::Pbf => {
+            let mut iter = pbf::features_from_file(io::Cursor::new(data)).map(|r| r.map_err(Error::from));
+            f(&mut iter)
+        }
+    }
+}
+
+/// Parse OSM features from an IO stream into a [Graph] as per the provided [Options].
 ///
-/// The provided stream will be automatically wrapped in a buffered reader when needed.
+/// NOTE: Because the Two-Pass architecture requires traversing the data twice, this function 
+/// buffers the entire stream into RAM first! For large files (e.g. >100MB), you should 
+/// strictly use `add_features_from_file` instead.
 pub fn add_features_from_io<'a, R: io::BufRead>(
     g: &'a mut Graph,
     options: &'a Options<'a>,
     mut reader: R,
 ) -> Result<(), Error> {
-    // Attempt to detect the file format if not specified
-    let detected_format = if options.file_format == FileFormat::Unknown {
-        FileFormat::detect(reader.fill_buf()?)
-    } else {
-        options.file_format
-    };
-
-    match detected_format {
-        FileFormat::Unknown => Err(Error::UnknownFileFormat),
-
-        FileFormat::Xml => {
-            let features = xml::features_from_file(reader);
-            GraphBuilder::new(g, options).add_features(features)?;
-            Ok(())
-        }
-
-        FileFormat::XmlGz => {
-            let d = flate2::bufread::MultiGzDecoder::new(reader);
-            let b = io::BufReader::new(d);
-            let features = xml::features_from_file(b);
-            GraphBuilder::new(g, options).add_features(features)?;
-            Ok(())
-        }
-
-        FileFormat::XmlBz2 => {
-            let d = bzip2::bufread::MultiBzDecoder::new(reader);
-            let b = io::BufReader::new(d);
-            let features = xml::features_from_file(b);
-            GraphBuilder::new(g, options).add_features(features)?;
-            Ok(())
-        }
-
-        FileFormat::Pbf => {
-            let features = pbf::features_from_file(reader);
-            GraphBuilder::new(g, options).add_features(features)?;
-            Ok(())
-        }
-    }
+    log::warn!(target: "routx::osm", "add_features_from_io buffers the entire stream into RAM for Two-Pass processing. Use add_features_from_file for large maps.");
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    add_features_from_buffer(g, options, &data)
 }
 
 /// Parse OSM features from a file at the provided path into a [Graph] as per the provided [Options].
+/// Uses a Two-Pass architecture to drastically reduce RAM usage.
 pub fn add_features_from_file<'a, P: AsRef<Path>>(
     g: &'a mut Graph,
     options: &'a Options<'a>,
     path: P,
 ) -> Result<(), Error> {
-    let f = File::open(path)?;
-    let b = io::BufReader::new(f);
-    add_features_from_io(g, options, b)
+    let mut needed_nodes = rustc_hash::FxHashSet::default();
+
+    // Pass 1: Identify all nodes utilized by routable ways.
+    with_file_iterator(path.as_ref(), options.file_format, |features| {
+        graph_builder::pass1(options, features, &mut needed_nodes)
+    })?;
+
+    // Pass 2: Actually build the graph loading only needed nodes and ways.
+    with_file_iterator(path.as_ref(), options.file_format, |features| {
+        let mut builder = GraphBuilder::new(g, options, std::mem::take(&mut needed_nodes));
+        builder.add_features(features)
+    })?;
+
+    Ok(())
 }
 
 /// Parse OSM features from a static buffer into a [Graph] as per the provided [Options].
+/// Uses a Two-Pass architecture.
 pub fn add_features_from_buffer<'a>(
     g: &'a mut Graph,
     options: &'a Options<'a>,
     data: &[u8],
 ) -> Result<(), Error> {
-    if options.file_format == FileFormat::Xml {
-        // Fast path is available for in-memory XML data
-        let features = xml::features_from_buffer(data);
-        GraphBuilder::new(g, options).add_features(features)?;
-        Ok(())
-    } else {
-        // Wrap the buffer in a cursor and use the IO path
-        let cursor = io::Cursor::new(data);
-        add_features_from_io(g, options, cursor)
-    }
+    let mut needed_nodes = rustc_hash::FxHashSet::default();
+
+    // Pass 1: Identify all nodes utilized by routable ways.
+    with_buffer_iterator(data, options.file_format, |features| {
+        graph_builder::pass1(options, features, &mut needed_nodes)
+    })?;
+
+    // Pass 2: Actually build the graph loading only needed nodes and ways.
+    with_buffer_iterator(data, options.file_format, |features| {
+        let mut builder = GraphBuilder::new(g, options, std::mem::take(&mut needed_nodes));
+        builder.add_features(features)
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]

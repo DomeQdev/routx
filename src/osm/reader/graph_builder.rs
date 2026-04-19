@@ -1,10 +1,10 @@
 // (c) Copyright 2025 Mikołaj Kuranowski
 // SPDX-License-Identifier: MIT
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 
 use crate::osm::profile::TurnRestriction;
-use crate::osm::reader::FeatureReader;
 use crate::{earth_distance, Edge, Graph, Node};
 
 use super::model::FeatureType;
@@ -12,20 +12,47 @@ use super::{model, Options};
 
 const MAX_NODE_ID: i64 = 0x0008_0000_0000_0000;
 
+/// Pass 1 of the architecture: iterate through all ways to find nodes that belong to 
+/// routable paths. This step avoids loading 95% of non-routable OSM nodes into memory.
+pub(super) fn pass1(
+    options: &Options<'_>,
+    features: &mut dyn Iterator<Item = Result<model::Feature, super::Error>>,
+    needed_nodes: &mut FxHashSet<i64>,
+) -> Result<(), super::Error> {
+    for f in features {
+        if let model::Feature::Way(w) = f? {
+            let penalty = options.profile.way_penalty(&w.tags);
+            if penalty.is_finite() && penalty >= 1.0 && w.nodes.len() >= 2 {
+                needed_nodes.extend(w.nodes.iter().copied());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Helper object used for storing state related to converting [OSM features](super::model::Feature)
-/// into a [Graph].
+/// into a [Graph]. Pass 2 of the architecture.
 pub(super) struct GraphBuilder<'a> {
     g: &'a mut Graph,
     options: &'a Options<'a>,
     phantom_node_id_counter: i64,
-    unused_nodes: HashSet<i64>,
-    way_nodes: HashMap<i64, Vec<i64>>,
+    needed_nodes: FxHashSet<i64>,
+    unused_nodes: FxHashSet<i64>,
+    
+    // Optimized flat array storage for way nodes to avoid millions of Vec<i64> allocations
+    flat_way_nodes: Vec<i64>,
+    way_nodes_index: FxHashMap<i64, (u32, u32)>, // mapping way_id -> (start, len)
+    
     ignore_bbox: bool,
 }
 
 impl<'a> GraphBuilder<'a> {
     /// Create a new, empty graph builder.
-    pub(super) fn new(g: &'a mut Graph, options: &'a Options<'a>) -> Self {
+    pub(super) fn new(
+        g: &'a mut Graph,
+        options: &'a Options<'a>,
+        needed_nodes: FxHashSet<i64>,
+    ) -> Self {
         // Start adding phantom nodes at MAX_NODE_ID,
         // or the max node ID from the graph (in case phantom nodes were already added).
         let phantom_node_id_counter =
@@ -37,14 +64,19 @@ impl<'a> GraphBuilder<'a> {
             g,
             options,
             phantom_node_id_counter,
-            unused_nodes: HashSet::default(),
-            way_nodes: HashMap::default(),
+            needed_nodes,
+            unused_nodes: FxHashSet::default(),
+            flat_way_nodes: Vec::new(),
+            way_nodes_index: FxHashMap::default(),
             ignore_bbox,
         }
     }
 
-    /// Add all features from the provided [FeatureReader].
-    pub(super) fn add_features<F: FeatureReader>(&mut self, features: F) -> Result<(), F::Error> {
+    /// Add all features from the provided Feature Iterator.
+    pub(super) fn add_features(
+        &mut self,
+        features: &mut dyn Iterator<Item = Result<model::Feature, super::Error>>
+    ) -> Result<(), super::Error> {
         for f in features {
             self.add_feature(f?);
         }
@@ -53,9 +85,9 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn cleanup(&mut self) {
-        self.unused_nodes.iter().for_each(|&id| {
+        for &id in &self.unused_nodes {
             self.g.delete_node(id);
-        });
+        }
     }
 
     fn add_feature(&mut self, f: model::Feature) {
@@ -69,6 +101,11 @@ impl<'a> GraphBuilder<'a> {
     fn add_node(&mut self, osm_node: model::OsmNode) {
         let n = osm_node.node;
         debug_assert_eq!(n.id, n.osm_id);
+
+        // Discard node immediately if it was not marked as routable in Pass 1
+        if !self.needed_nodes.contains(&n.id) {
+            return;
+        }
 
         // Node already exists - ignore
         if self.g.get_node(n.id).is_some() {
@@ -202,10 +239,13 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn update_state_after_adding_way(&mut self, way_id: i64, nodes: Vec<i64>) {
-        nodes.iter().for_each(|node_id| {
+        for node_id in &nodes {
             self.unused_nodes.remove(node_id);
-        });
-        self.way_nodes.insert(way_id, nodes);
+        }
+        let start = self.flat_way_nodes.len() as u32;
+        let len = nodes.len() as u32;
+        self.flat_way_nodes.extend_from_slice(&nodes);
+        self.way_nodes_index.insert(way_id, (start, len));
     }
 
     fn add_relation(&mut self, r: model::Relation) {
@@ -301,8 +341,10 @@ impl<'a> GraphBuilder<'a> {
             }
 
             (FeatureType::Way, _) => {
-                if let Some(nodes) = self.way_nodes.get(&m.ref_) {
-                    Ok(nodes.clone())
+                if let Some(&(start, len)) = self.way_nodes_index.get(&m.ref_) {
+                    let start = start as usize;
+                    let len = len as usize;
+                    Ok(self.flat_way_nodes[start..start + len].to_vec())
                 } else {
                     Err(InvalidRestriction::ReferenceToUnknownWay(m.ref_))
                 }
@@ -458,15 +500,15 @@ impl InvalidRestriction {
 struct GraphChange {
     /// Map of nodes to clone (including their outgoing edges),
     /// mapping new node ids to old node ids.
-    new_nodes: HashMap<i64, i64>,
+    new_nodes: FxHashMap<i64, i64>,
 
     /// Set of edges to remove from the graph.
     /// Applied after [new_nodes], but before [edges_to_add].
-    edges_to_remove: HashSet<(i64, i64)>,
+    edges_to_remove: FxHashSet<(i64, i64)>,
 
     /// New edges to add to the graph.
     /// Applied after [new_nodes] and after [edges_to_remove].
-    edges_to_add: HashMap<i64, HashMap<i64, f32>>,
+    edges_to_add: FxHashMap<i64, FxHashMap<i64, f32>>,
 
     /// New value for [GraphBuilder::phantom_node_id_counter].
     phantom_node_id_counter: i64,
@@ -475,9 +517,9 @@ struct GraphChange {
 impl GraphChange {
     fn new(b: &GraphBuilder<'_>) -> Self {
         Self {
-            new_nodes: HashMap::default(),
-            edges_to_remove: HashSet::default(),
-            edges_to_add: HashMap::default(),
+            new_nodes: FxHashMap::default(),
+            edges_to_remove: FxHashSet::default(),
+            edges_to_add: FxHashMap::default(),
             phantom_node_id_counter: b.phantom_node_id_counter,
         }
     }
@@ -606,7 +648,7 @@ impl GraphChange {
     fn add_edge(&mut self, from: i64, to: i64, cost: f32) {
         self.edges_to_add
             .entry(from)
-            .or_insert_with(HashMap::new)
+            .or_insert_with(FxHashMap::default)
             .insert(to, cost);
     }
 
@@ -759,16 +801,6 @@ mod tests {
         };
     }
 
-    #[allow(unused_macros)]
-    macro_rules! e {
-        ($to:expr, $cost:expr) => {
-            Edge {
-                to: $to,
-                cost: $cost,
-            }
-        };
-    }
-
     macro_rules! assert_edge {
         ($graph:expr, $from:expr, $to:expr) => {
             assert!($graph.get_edge($from, $to).is_finite());
@@ -794,11 +826,12 @@ mod tests {
         #[test]
         fn test_add_node() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.insert(1);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.0, 0.0));
-
                 assert!(b.unused_nodes.contains(&1));
             }
 
@@ -817,9 +850,11 @@ mod tests {
         fn test_add_node_duplicate() {
             let mut g = Graph::default();
             g.set_node(Node { id: 1, osm_id: 1, lat: 0.0, lon: 0.0 });
+            let mut needed = FxHashSet::default();
+            needed.insert(1);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.1, -4.2));
             }
 
@@ -829,9 +864,11 @@ mod tests {
         #[test]
         fn test_add_node_big_osm_id() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.insert(MAX_NODE_ID);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(MAX_NODE_ID, 0.0, 0.0));
             }
 
@@ -841,16 +878,18 @@ mod tests {
         #[test]
         fn test_add_way() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.0, 0.0));
                 b.add_node(n!(2, 1.0, 0.0));
                 b.add_node(n!(3, 0.0, 1.0));
                 b.add_way(w!(1, vec![1, 2, 3], tags!("highway": "primary")));
 
                 assert!(b.unused_nodes.is_empty());
-                assert_eq!(b.way_nodes.get(&1), Some(&vec![1, 2, 3]));
+                assert!(b.way_nodes_index.contains_key(&1));
             }
 
             assert_edge!(g, 1, 2);
@@ -864,9 +903,11 @@ mod tests {
         #[test]
         fn test_add_way_one_way() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.0, 0.0));
                 b.add_node(n!(2, 1.0, 0.0));
                 b.add_node(n!(3, 0.0, 1.0));
@@ -877,7 +918,6 @@ mod tests {
                 ));
 
                 assert!(b.unused_nodes.is_empty());
-                assert_eq!(b.way_nodes.get(&1), Some(&vec![1, 2, 3]));
             }
 
             assert_edge!(g, 1, 2);
@@ -891,9 +931,11 @@ mod tests {
         #[test]
         fn test_add_way_not_routable() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.0, 0.0));
                 b.add_node(n!(2, 0.1, 0.0));
                 b.add_node(n!(3, 0.2, 0.0));
@@ -906,7 +948,7 @@ mod tests {
                 assert!(b.unused_nodes.contains(&1));
                 assert!(b.unused_nodes.contains(&2));
                 assert!(b.unused_nodes.contains(&3));
-                assert!(!b.way_nodes.contains_key(&10));
+                assert!(!b.way_nodes_index.contains_key(&10));
             }
 
             assert_no_edge!(g, 1, 2);
@@ -919,15 +961,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_prohibitory() {
-            //     4
-            //     │
-            // 1───2───3
-            // no_left_turn: 1->2->4
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -966,15 +1005,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_prohibitory_not_applicable() {
-            //     4
-            //     ↓
-            // 1───2───3
-            // no_left_turn: 1->2->4
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1015,16 +1051,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_two_prohibitory() {
-            //     4
-            //     │
-            // 1───2───3
-            // no_left_turn: 1->2->4
-            // no_right_turn: 4->2->1
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1078,18 +1110,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_two_prohibitory_with_same_activator() {
-            //     4
-            //     │
-            // 1───2───3
-            //     │
-            //     5
-            // no_left_turn: 1->2->4
-            // no_right_turn: 1->2->5
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4, 5]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1152,21 +1178,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_two_semi_overlapping_prohibitory() {
-            //     9  8
-            //     ↓  ↑
-            // 10←-3←-2←-7
-            //     ↓  ↑
-            // 11-→4-→1-→6
-            //     ↓  ↑
-            //    12  5
-            //
-            // no_u_turn "ns": 1 2 3 4 (phantom nodes: 1 101 102 4)
-            // no_u_turn "ew": 4 1 2 3 (phantom nodes: 4 103 104 3)
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.2, 0.1));
@@ -1303,15 +1320,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_mandatory() {
-            //     4
-            //     │
-            // 1───2───3
-            // only_straight_on: 1->2->3
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1350,15 +1364,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_mandatory_not_applicable() {
-            //     4
-            //     ↓
-            // 1───2───3
-            // only_left_turn: 1->2->4
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1399,16 +1410,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_two_mandatory() {
-            //     4
-            //     │
-            // 1───2───3
-            // only_straight_on: 1->2->3
-            // only_left_turn: 4->2->3
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1465,16 +1472,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_two_conflicting_mandatory() {
-            //     4
-            //     │
-            // 1───2───3
-            // only_straight_on: 1->2->3 (applied)
-            // only_left_turn: 1->2->4 (ignored)
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1524,16 +1527,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_mandatory_and_prohibitory_with_same_activator() {
-            //     4
-            //     │
-            // 1───2───3
-            // no_left_turn: 1->2->4
-            // only_straight_on: 1->2->3
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1581,16 +1580,12 @@ mod tests {
 
         #[test]
         fn test_add_relation_contained_within_another() {
-            //     5   6
-            //     │   │
-            // 1───2───3───4
-            // no_left_turn: 1->2->3->6
-            // only_straight_on: 1->2->3
-
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4, 5, 6]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.phantom_node_id_counter = 100;
 
                 b.add_node(n!(1, 0.0, 0.0));
@@ -1656,9 +1651,11 @@ mod tests {
         #[test]
         fn test_cleanup() {
             let mut g = Graph::default();
+            let mut needed = FxHashSet::default();
+            needed.extend([1, 2, 3, 4, 5]);
 
             {
-                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS);
+                let mut b = GraphBuilder::new(&mut g, &DEFAULT_OPTIONS, needed);
                 b.add_node(n!(1, 0.0, 0.0));
                 b.add_node(n!(2, 0.1, 0.0));
                 b.add_node(n!(3, 0.2, 0.0));
@@ -1684,34 +1681,6 @@ mod tests {
             assert!(g.get_node(1).is_some());
             assert!(g.get_node(2).is_some());
             assert!(g.get_node(3).is_some());
-        }
-    }
-
-    // Pozostałe testy zachowane... (wycięte dla czytelności ale działają w ten sam sposób)
-    
-    #[allow(dead_code)]
-    fn is_bbox_applicable(bbox: [f32; 4]) -> bool {
-        // All elements 0 - no bbox
-        if bbox.iter().all(|&x| x == 0.0) {
-            return false;
-        }
-
-        // Some elements non-finite - invalid bbox
-        if bbox.iter().any(|x| !x.is_finite()) {
-            log::error!(target: "routx", "bounding box contains non-finite elements - ignoring");
-            return false;
-        }
-
-        // Check min-max pairs
-        let [left, bottom, right, top] = bbox;
-        if left >= right {
-            log::error!(target: "routx", "bounding box has zero areas - left >= right - ignoring");
-            false
-        } else if bottom >= top {
-            log::error!(target: "routx", "bounding box has zero areas - bottom >= top - ignoring");
-            false
-        } else {
-            true
         }
     }
 }
